@@ -1,14 +1,28 @@
 import os
 import streamlit as st
-import chromadb
 import anthropic
 from pathlib import Path
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
+from azure.keyvault.secrets import SecretClient
+from azure.identity import DefaultAzureCredential
+from sentence_transformers import SentenceTransformer
+from vector_store import get_pinecone_client, get_or_create_index, search
 
 # Load API key
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+
+# Fetch API key from Azure Key Vault
+def get_anthropic_client():
+    """Fetch API key from Azure Key Vault and create Anthropic client."""
+    key_vault_url = os.getenv("AZURE_KEY_VAULT_URL")
+    credential = DefaultAzureCredential()
+    secret_client = SecretClient(vault_url=key_vault_url, credential=credential)
+    api_key = secret_client.get_secret("ANTHROPIC-API-KEY").value
+    return anthropic.Anthropic(api_key=api_key)
+
+client = get_anthropic_client()
 
 # --- Page Config ---
 st.set_page_config(
@@ -17,34 +31,24 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- Load Models (cached so they don't reload on every message) ---
+# --- Load Models ---
 @st.cache_resource
 def load_models():
-    """Load embedding model and ChromaDB — cached after first load."""
-    with st.spinner("🔢 Loading embedding model... please wait"):
+    """Load embedding model and Pinecone index."""
+    with st.spinner("🔢 Loading models..."):
         model = SentenceTransformer("all-MiniLM-L6-v2")
-        chroma_client = chromadb.PersistentClient(path="./chroma_db")
-        collection = chroma_client.get_collection("rag_knowledge_base")
-    return model, collection
+        pc = get_pinecone_client()
+        index_name = os.getenv("PINECONE_INDEX_NAME")
+        index = get_or_create_index(pc, index_name)
+    return model, index
 
-model, collection = load_models()
+model, index = load_models()
 
 # --- RAG Functions ---
 def retrieve_context(question: str, n_results: int = 5) -> list:
     """Find most relevant chunks for a question."""
     question_embedding = model.encode(question).tolist()
-    results = collection.query(
-        query_embeddings=[question_embedding],
-        n_results=n_results
-    )
-    chunks = []
-    for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
-        chunks.append({
-            "text": doc,
-            "title": meta["title"],
-            "url": meta["url"]
-        })
-    return chunks
+    return search(index, question_embedding, n_results)
 
 def build_prompt(question: str, chunks: list) -> str:
     """Build the RAG prompt with context."""
@@ -95,6 +99,7 @@ def ask_with_streaming(question: str):
 
 # --- UI ---
 st.title("🧠 Data Engineering Knowledge Assistant")
+st.caption(f"📊 Vector DB: Pinecone ☁️")
 st.caption("Powered by Claude AI + RAG | Knowledge base: 25 Wikipedia articles")
 
 # Sidebar with info
@@ -102,6 +107,13 @@ with st.sidebar:
     st.header("📚 Knowledge Base")
     st.markdown("""
     This assistant knows about:
+    
+    **📖 Books**
+    - Fundamentals of Data Engineering
+    - The Data Engineer's Guide to Apache Spark
+    - Generative AI & LLMs for Dummies
+    
+    **🌐 Wikipedia Articles**
     - Data Pipelines & ETL
     - Snowflake & Data Warehouses
     - Apache Spark & Kafka
@@ -111,7 +123,9 @@ with st.sidebar:
     - And much more!
     """)
     st.divider()
-    st.caption(f"📊 {collection.count()} chunks indexed")
+    stats = index.describe_index_stats()
+    st.caption(f"📊 {stats['total_vector_count']} chunks indexed")
+    st.caption(f"📚 3 books + 25 Wikipedia articles")
     st.divider()
     if st.button("🗑️ Clear Chat"):
         st.session_state.messages = []
