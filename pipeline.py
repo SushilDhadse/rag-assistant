@@ -1,26 +1,25 @@
 import os
-import json
 import re
-import fitz
-import chromadb
+import logging
+from typing import List, Dict, Any
 from pathlib import Path
-from dotenv import load_dotenv
 from datetime import datetime
+
+import fitz
+import wikipediaapi
+from dotenv import load_dotenv
 from prefect import flow, task, get_run_logger
 from azure.storage.blob import BlobServiceClient
-from azure.keyvault.secrets import SecretClient
-from azure.identity import DefaultAzureCredential
 from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# Internal utilities
 from vector_store import get_pinecone_client, get_or_create_index, upsert_chunks
-import wikipediaapi
-from tqdm import tqdm
+from snowflake_logger import PipelineRunLogger
 
-load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+load_dotenv()
 
-CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
-CONTAINER_NAME = os.getenv("AZURE_CONTAINER_NAME")
-
+# --- Configuration Constants ---
 TOPICS = [
     "Data engineering", "Extract, transform, load", "Data pipeline",
     "Snowflake Inc", "Apache Airflow", "Retrieval-augmented generation",
@@ -50,201 +49,180 @@ BOOKS = [
     }
 ]
 
-# -------------------------------------------------------
-# TASK 1: Fetch Wikipedia Articles
-# -------------------------------------------------------
-@task(name="Fetch Wikipedia Articles", retries=2, retry_delay_seconds=30)
-def fetch_wikipedia_articles() -> list:
+def clean_text(text: str) -> str:
+    """
+    Standardizes and cleans extracted text for embedding.
+    
+    Args:
+        text: Raw text string from source.
+        
+    Returns:
+        Sanitized text string.
+    """
+    # Remove Table of Contents dots
+    text = re.sub(r'\.{3,}', ' ', text)
+    # Remove non-ASCII characters (encoding artifacts)
+    text = text.encode("ascii", "ignore").decode("ascii")
+    # Normalize whitespace and remove newlines/tabs
+    text = text.replace('\n', ' ').replace('\t', ' ')
+    # Remove standalone page numbers
+    text = re.sub(r'^\s*\d+\s*$', '', text, flags=re.MULTILINE)
+    # Collapse multiple spaces
+    text = re.sub(r'\s+', ' ', text)
+    
+    return text.strip()
+
+@task(name="Fetch Wikipedia Articles", retries=2)
+def fetch_wikipedia_articles() -> List[Dict[str, Any]]:
+    """
+    Retrieves content from Wikipedia for defined topics.
+    """
     logger = get_run_logger()
-    logger.info(f"Fetching {len(TOPICS)} Wikipedia articles...")
-
-    wiki = wikipediaapi.Wikipedia(language="en", user_agent="rag-assistant/1.0")
+    wiki = wikipediaapi.Wikipedia(
+        language="en", 
+        user_agent="DataEngineeringAssistant/1.0 (contact: sushildhadse@example.com)"
+    )
+    
     articles = []
-
     for topic in TOPICS:
-        page = wiki.page(topic)
-        if page.exists():
-            articles.append({
-                "title": page.title,
-                "url": page.fullurl,
-                "text": page.text
-            })
-            logger.info(f"✅ Fetched: {page.title}")
-        else:
-            logger.warning(f"❌ Not found: {topic}")
-
-    logger.info(f"Fetched {len(articles)} articles")
+        try:
+            page = wiki.page(topic)
+            if page.exists():
+                articles.append({
+                    "title": page.title, 
+                    "url": page.fullurl, 
+                    "text": page.text, 
+                    "source_type": "wikipedia"
+                })
+        except Exception as e:
+            logger.error(f"Failed to fetch Wikipedia topic '{topic}': {e}")
+            
+    logger.info(f"Successfully fetched {len(articles)} Wikipedia articles.")
     return articles
 
-
-# -------------------------------------------------------
-# TASK 2: Download PDFs from Azure
-# -------------------------------------------------------
-@task(name="Download PDFs from Azure", retries=2, retry_delay_seconds=30)
-def download_pdfs_from_azure() -> list:
+@task(name="Ingest Azure PDF Documents")
+def ingest_azure_pdfs() -> List[Dict[str, Any]]:
+    """
+    Downloads and extracts text from PDF blobs in Azure Storage.
+    """
     logger = get_run_logger()
-    logger.info("Connecting to Azure Blob Storage...")
-
-    blob_service_client = BlobServiceClient.from_connection_string(CONNECTION_STRING)
-    all_pages = []
-
+    connect_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+    container = os.getenv("AZURE_CONTAINER_NAME")
+    
+    if not connect_str or not container:
+        raise ValueError("Azure Storage credentials missing from environment variables.")
+        
+    blob_service_client = BlobServiceClient.from_connection_string(connect_str)
+    book_data = []
+    
     for book in BOOKS:
-        logger.info(f"Downloading: {book['title']}")
-
-        # Download PDF
-        blob_client = blob_service_client.get_blob_client(
-            container=CONTAINER_NAME,
-            blob=book["blob_name"]
-        )
-        pdf_bytes = blob_client.download_blob().readall()
-
-        # Extract and clean text
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        for i, page in enumerate(doc):
-            text = page.get_text().strip()
-            text = clean_text(text)
-            if len(text) < 100:
-                continue
-            all_pages.append({
+        try:
+            logger.info(f"Processing book: {book['title']}")
+            blob_client = blob_service_client.get_blob_client(
+                container=container, 
+                blob=book["blob_name"]
+            )
+            pdf_bytes = blob_client.download_blob().readall()
+            
+            # Stream PDF content into text
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            full_book_text = "".join([page.get_text() for page in doc])
+            
+            book_data.append({
                 "title": book["title"],
                 "url": book["url"],
-                "page": i + 1,
-                "text": text
+                "text": clean_text(full_book_text),
+                "source_type": "book"
             })
+        except Exception as e:
+            logger.error(f"Failed to process book '{book['title']}': {e}")
+            
+    return book_data
 
-        logger.info(f"✅ Extracted pages from {book['title']}")
-
-    logger.info(f"Total pages extracted: {len(all_pages)}")
-    return all_pages
-
-
-# -------------------------------------------------------
-# TASK 3: Chunk All Documents
-# -------------------------------------------------------
-@task(name="Chunk Documents")
-def chunk_documents(articles: list, book_pages: list) -> list:
+@task(name="Document Chunking")
+def chunk_documents(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Segments long documents into chunks for semantic indexing.
+    """
     logger = get_run_logger()
-    logger.info("Chunking all documents...")
-
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50,
+        chunk_size=800, 
+        chunk_overlap=80,
         separators=["\n\n", "\n", ". ", " "]
     )
-
+    
     all_chunks = []
-
-    # Chunk Wikipedia articles
-    for article in articles:
-        chunks = splitter.split_text(article["text"])
-        for i, chunk in enumerate(chunks):
+    for doc in docs:
+        chunks = splitter.split_text(doc["text"])
+        for i, chunk_text in enumerate(chunks):
             all_chunks.append({
-                "id": f"wiki_{article['title']}_{i}",
-                "title": article["title"],
-                "url": article["url"],
-                "chunk_index": i,
-                "source_type": "wikipedia",
-                "text": chunk
+                "id": f"{doc['source_type']}_{doc['title']}_{i}",
+                "title": doc["title"],
+                "url": doc["url"],
+                "text": chunk_text,
+                "source_type": doc["source_type"],
+                "chunk_index": i
             })
-
-    wiki_count = len(all_chunks)
-    logger.info(f"Wikipedia chunks: {wiki_count}")
-
-    # Chunk book pages
-    for page in book_pages:
-        chunks = splitter.split_text(page["text"])
-        for i, chunk in enumerate(chunks):
-            all_chunks.append({
-                "id": f"book_{page['title']}_p{page['page']}_{i}",
-                "title": page["title"],
-                "url": page["url"],
-                "chunk_index": i,
-                "source_type": "book",
-                "text": chunk
-            })
-
-    book_count = len(all_chunks) - wiki_count
-    logger.info(f"Book chunks: {book_count}")
-    logger.info(f"Total chunks: {len(all_chunks)}")
-
+            
+    logger.info(f"Created {len(all_chunks)} chunks from {len(docs)} documents.")
     return all_chunks
 
-
-# -------------------------------------------------------
-# TASK 4: Embed and Store in Pinecone
-# -------------------------------------------------------
-@task(name="Embed and Store in Pinecone")
-def embed_and_store(chunks: list) -> int:
+@task(name="Pinecone Synchronization")
+def embed_and_sync(chunks: List[Dict[str, Any]]) -> int:
+    """
+    Generates embeddings and synchronizes chunks with Pinecone Vector DB.
+    """
     logger = get_run_logger()
-    logger.info("Loading embedding model...")
-
     model = SentenceTransformer("all-MiniLM-L6-v2")
-
-    logger.info("Connecting to Pinecone via Azure Key Vault...")
+    
+    # Initialization using shared utility
     pc = get_pinecone_client()
     index_name = os.getenv("PINECONE_INDEX_NAME")
     index = get_or_create_index(pc, index_name)
-
-    logger.info(f"Embedding {len(chunks)} chunks...")
-
-    BATCH_SIZE = 100
-    all_embeddings = []
-
-    for i in range(0, len(chunks), BATCH_SIZE):
-        batch = chunks[i:i + BATCH_SIZE]
-        texts = [c["text"] for c in batch]
-        embeddings = model.encode(texts).tolist()
-        all_embeddings.extend(embeddings)
-
-    logger.info("Storing in Pinecone...")
-    count = upsert_chunks(index, chunks, all_embeddings)
-
-    logger.info(f"✅ Stored {count} chunks in Pinecone")
+    
+    texts = [c["text"] for c in chunks]
+    logger.info("Generating embeddings for all chunks...")
+    embeddings = model.encode(texts).tolist()
+    
+    count = upsert_chunks(index, chunks, embeddings)
+    logger.info(f"Successfully synchronized {count} vectors with Pinecone.")
     return count
 
-
-# -------------------------------------------------------
-# TASK 5: Notify Completion
-# -------------------------------------------------------
-@task(name="Notify Completion")
-def notify_completion(chunk_count: int):
-    logger = get_run_logger()
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    logger.info("=" * 50)
-    logger.info("🎉 RAG Knowledge Base Refresh Complete!")
-    logger.info(f"⏰ Timestamp: {timestamp}")
-    logger.info(f"📊 Total chunks indexed: {chunk_count}")
-    logger.info("=" * 50)
-
-
-# -------------------------------------------------------
-# HELPER
-# -------------------------------------------------------
-def clean_text(text: str) -> str:
-    text = re.sub(r'^\d+\s*$', '', text, flags=re.MULTILINE)
-    text = re.sub(r'CHAPTER\s+\d+.*?\n', '', text)
-    text = re.sub(r'These materials are ©.*?\n', '', text)
-    text = re.sub(r'.*?strictly prohibited.*?\n', '', text)
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    text = re.sub(r' {2,}', ' ', text)
-    return text.strip()
-
-
-# -------------------------------------------------------
-# FLOW
-# -------------------------------------------------------
 @flow(name="RAG Knowledge Base Refresh")
-def rag_refresh_pipeline():
+def rag_pipeline():
+    """
+    Main orchestration flow for the Knowledge Base refresh.
+    """
     logger = get_run_logger()
-    logger.info("🚀 Starting RAG Knowledge Base Refresh Pipeline")
+    sf_logger  = PipelineRunLogger()
 
-    # Run all tasks
-    articles = fetch_wikipedia_articles()
-    book_pages = download_pdfs_from_azure()
-    chunks = chunk_documents(articles, book_pages)
-    chunk_count = embed_and_store(chunks)
-    notify_completion(chunk_count)
+    try:
+        logger.info("Starting Knowledge Base Refresh Pipeline.")
 
+        # Ingestion Layer
+        wiki_docs = fetch_wikipedia_articles()
+        pdf_docs = ingest_azure_pdfs()
+
+        sf_logger.update(
+                wiki_articles_fetched=len(wiki_docs),
+                pdfs_ingested=len(pdf_docs),
+            )
+        
+        # Transformation Layer
+        all_chunks = chunk_documents(wiki_docs + pdf_docs)
+        sf_logger.update(total_chunks_created=len(all_chunks))
+        
+        # Loading Layer
+        count = embed_and_sync(all_chunks)
+        sf_logger.update(vectors_upserted=count)
+        
+        logger.info(f"Pipeline execution completed. Total vectors processed: {count}")
+        sf_logger.commit(status="SUCCESS")
+    
+    except Exception as e:
+        sf_logger.error_message = str(e)
+        sf_logger.commit(status="FAILED")
+        raise
 
 if __name__ == "__main__":
-    rag_refresh_pipeline()
+    rag_pipeline()

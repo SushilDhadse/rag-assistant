@@ -24,9 +24,9 @@ def get_or_create_index(pc: Pinecone, index_name: str):
         print(f"📦 Creating new Pinecone index: {index_name}")
         pc.create_index(
             name=index_name,
-            dimension=384,          # matches all-MiniLM-L6-v2 output
+            dimension=384,          # matches all-MiniLM-L6-v2 output   
             metric="cosine",        # same as ChromaDB setup
-            spec=ServerlessSpec(
+            spec=ServerlessSpec(                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 
                 cloud="aws",
                 region="us-east-1"  # free tier region
             )
