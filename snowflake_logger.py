@@ -1,5 +1,7 @@
 import os
 import uuid
+import json
+import time
 from dotenv import load_dotenv
 from datetime import datetime, timezone
 from snowflake.connector import connect
@@ -10,6 +12,7 @@ from azure.identity import DefaultAzureCredential
 load_dotenv()
 
 SNOWFLAKE_TABLE = "RAG_ASSISTANT.PIPELINES.PIPELINE_RUN_LOG"
+CHAT_TABLE = "RAG_ASSISTANT.PIPELINES.RAG_CHAT_HISTORY"
 
 def get_snowflake_conn():
     """Fetch Snowflake connection string from Azure Key Vault."""
@@ -81,3 +84,46 @@ class PipelineRunLogger:
             conn.commit()
         finally:
             conn.close()
+
+
+def log_chat_turn(
+    session_id:      str,
+    question:        str,
+    answer:          str,
+    chunks:          list,
+    response_time_ms: int,
+):
+    """Write a single Q&A turn + RAG sources to Snowflake."""
+    sources_payload = [
+        {
+            "title": c["title"],
+            "url":   c["url"],
+            "score": round(c.get("score", 0), 4),
+        }
+        for c in chunks
+    ]
+
+    conn = get_snowflake_conn()
+    try:
+        conn.cursor().execute(f"""
+            INSERT INTO {CHAT_TABLE} (
+                message_id, session_id, asked_at, question, answer, 
+                sources_used, num_chunks_used, top_source_title, response_time_ms
+            )
+            SELECT 
+                %(m_id)s, %(s_id)s, %(asked)s, %(q)s, %(a)s, 
+                PARSE_JSON(%(src)s), %(num)s, %(top)s, %(r_time)s
+            """, {
+                "m_id": str(uuid.uuid4()),
+                "s_id": session_id,
+                "asked": datetime.now(timezone.utc),
+                "q": question,
+                "a": answer,
+                "src": json.dumps(sources_payload),
+                "num": len(chunks),
+                "top": chunks[0]["title"] if chunks else None,
+                "r_time": response_time_ms
+            })
+        conn.commit()
+    finally:
+        conn.close()

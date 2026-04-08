@@ -1,147 +1,190 @@
 import os
-import streamlit as st
-import anthropic
+import time
+import uuid
+import logging
+from typing import List, Tuple, Dict, Any
 from pathlib import Path
 from dotenv import load_dotenv
+
+import streamlit as st
+import anthropic
 from sentence_transformers import SentenceTransformer
 from azure.keyvault.secrets import SecretClient
 from azure.identity import DefaultAzureCredential
-from vector_store import get_pinecone_client, get_or_create_index, search
 
-# Load Environment Variables
+# Internal utility imports
+from vector_store import get_pinecone_client, get_or_create_index, search
+from snowflake_logger import log_chat_turn
+
+# Load configuration
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+
+# Standard logging for monitoring application performance
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # --- Resource Loading (Cached) ---
 @st.cache_resource
-def initialize_services():
-    """Single point of entry for all external services and models."""
-    with st.spinner("🔢 Connecting to services..."):
-        # 1. Fetch all Secrets from Azure Key Vault
-        kv_url = os.getenv("AZURE_KEY_VAULT_URL")
+def initialize_services() -> Tuple[anthropic.Anthropic, SentenceTransformer, Any]:
+    """
+    Initializes cloud clients and local ML models in a single cached call.
+    Retrieves all sensitive credentials from Azure Key Vault.
+    """
+    # 1. Access Azure Key Vault
+    kv_url = os.getenv("AZURE_KEY_VAULT_URL")
+    if not kv_url:
+        st.error("Azure Key Vault URL missing from environment configuration.")
+        st.stop()
+        
+    try:
         credential = DefaultAzureCredential()
         secret_client = SecretClient(vault_url=kv_url, credential=credential)
         
+        # 2. Fetch API Secrets
         anthropic_key = secret_client.get_secret("ANTHROPIC-API-KEY").value
         pinecone_key = secret_client.get_secret("PINECONE-API-KEY").value
         
-        # 2. Initialize Clients
+        # 3. Initialize Production Clients
         ai_client = anthropic.Anthropic(api_key=anthropic_key)
-        pc = get_pinecone_client() 
+        pc_client = get_pinecone_client()
         
-        # 3. Load Index and Embedding Model
+        # 4. Load Index and Embedding Model (384-dimensional)
         index_name = os.getenv("PINECONE_INDEX_NAME")
-        index = get_or_create_index(pc, index_name)
+        index = get_or_create_index(pc_client, index_name)
         model = SentenceTransformer("all-MiniLM-L6-v2")
         
-    return ai_client, model, index
+        return ai_client, model, index
+        
+    except Exception as e:
+        logger.error(f"Initialization failure: {e}")
+        st.error("Failed to connect to backend services. Check logs for details.")
+        st.stop()
 
-# Global instances
+# Shared singleton instances
 client, model, index = initialize_services()
 
-# --- Page Config ---
+# --- Application Configuration ---
 st.set_page_config(
     page_title="Data Engineering Knowledge Assistant",
     page_icon="🧠",
     layout="wide"
 )
 
-# --- RAG Functions ---
-def retrieve_context(question: str, n_results: int = 5) -> list:
-    """Find most relevant chunks using Pinecone."""
+# --- Logic Layer ---
+def retrieve_context(question: str, n_results: int = 5) -> List[Dict[str, Any]]:
+    """
+    Performs semantic retrieval to find relevant knowledge chunks.
+    """
     question_embedding = model.encode(question).tolist()
     return search(index, question_embedding, n_results)
 
-def ask_with_streaming(question: str):
-    """Orchestrates retrieval and streaming response."""
-    # Step 1: Retrieve chunks
+def generate_rag_response(question: str):
+    """
+    Orchestrates the RAG flow: Retrieval -> Prompt Construction -> Streaming Generation.
+    """
+    # Step 1: Context Retrieval
     chunks = retrieve_context(question)
     
-    # Step 2: Format context for prompt
+    # Step 2: Context Formatting
     context_text = ""
     for i, chunk in enumerate(chunks):
         context_text += f"\n--- Source {i+1}: {chunk['title']} ---\n{chunk['text']}\n"
 
-    # Step 3: Stream from Claude
+    # Step 3: LLM Interaction with System Framing
     full_reply = ""
     placeholder = st.empty()
     
-    system_instr = (
-        "You are a helpful Data Engineering and AI assistant. "
+    system_instruction = (
+        "You are an expert Data Engineering and AI assistant. "
         "Answer the user's question using ONLY the context provided. "
-        "If the answer is not in the context, say 'I don't have enough "
-        "information in my knowledge base to answer that.' "
-        "Be concise and clear. Use bullet points where helpful."
+        "If the answer is not in the context, state that you do not have "
+        "enough information in your knowledge base. "
+        "Maintain a professional, concise tone and use markdown for clarity."
     )
 
-    with client.messages.stream(
-        model="claude-sonnet-4-5",
-        max_tokens=1024,
-        system=system_instr,
-        messages=[{"role": "user", "content": f"CONTEXT:\n{context_text}\n\nQUESTION: {question}"}]
-    ) as stream:
-        for text in stream.text_stream:
-            full_reply += text
-            placeholder.markdown(full_reply + "▌")
+    try:
+        with client.messages.stream(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            system=system_instruction,
+            messages=[{"role": "user", "content": f"CONTEXT:\n{context_text}\n\nQUESTION: {question}"}]
+        ) as stream:
+            for text in stream.text_stream:
+                full_reply += text
+                placeholder.markdown(full_reply + "▌")
+    except Exception as e:
+        logger.error(f"LLM Generation Error: {e}")
+        full_reply = "I encountered an error generating a response. Please try again."
 
     placeholder.markdown(full_reply)
     return full_reply, chunks
 
 # --- UI Layout ---
 st.title("🧠 Data Engineering Knowledge Assistant")
-st.caption("📊 Vector DB: Pinecone ☁️ | Powered by Claude AI + RAG")
+st.caption("Vector DB: Pinecone (Serverless) | Engine: Claude Sonnet 4.5 | Orchestration: Prefect")
 
-# Sidebar
+# Sidebar Implementation
 with st.sidebar:
-    st.header("📚 Knowledge Base")
+    st.header("Knowledge Base")
     st.markdown("""
-    **📖 Books**
+    **Indexed Content**
     - Fundamentals of Data Engineering
     - The Data Engineer's Guide to Apache Spark
     - Generative AI & LLMs for Dummies
-    
-    **🌐 Wikipedia Articles**
-    - Data Pipelines, Snowflake, Spark, Kafka, MLOps, and more.
+    - Curated Wikipedia articles (ETL, MLOps, Snowflake, etc.)
     """)
     st.divider()
     
-    # Display Index Stats
-    stats = index.describe_index_stats()
-    st.caption(f"📊 {stats['total_vector_count']} chunks indexed")
-    st.divider()
+    try:
+        stats = index.describe_index_stats()
+        st.metric("Indexed Chunks", stats['total_vector_count'])
+    except Exception:
+        st.caption("Status: Knowledge base stats temporarily unavailable.")
     
-    if st.button("🗑️ Clear Chat"):
+    st.divider()
+    if st.button("Clear Conversation"):
         st.session_state.messages = []
         st.rerun()
 
-# Session state initialization
+# Conversation Management
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
 
-# Display history
+# Render chat history
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
         if message["role"] == "assistant" and "sources" in message:
-            with st.expander("📚 Sources used"):
-                seen = {chunk["title"] for chunk in message["sources"]}
-                for title in seen:
-                    # Find first matching URL for the title
-                    url = next(c["url"] for c in message["sources"] if c["title"] == title)
+            with st.expander("Reference Sources"):
+                unique_sources = {chunk["title"]: chunk["url"] for chunk in message["sources"]}
+                for title, url in unique_sources.items():
                     st.markdown(f"- [{title}]({url})")
 
-# User Input Logic
-if prompt := st.chat_input("Ask me anything about Data Engineering or AI..."):
-    # Add user message
+# User Query Interaction
+if prompt := st.chat_input("Query the Data Engineering knowledge base..."):
+    # Record and display user intent
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Generate assistant response
+    # Process and display assistant response
     with st.chat_message("assistant"):
-        with st.spinner("🔍 Searching knowledge base..."):
-            answer, chunks = ask_with_streaming(prompt)
+        with st.spinner("Retrieving relevant context..."):
+            t0 = time.time()
+            answer, chunks = generate_rag_response(prompt)
+            elapsed_ms = int((time.time() - t0) * 1000)
 
-    # Save to history
+            log_chat_turn(
+                session_id       = st.session_state.session_id,
+                question         = prompt,
+                answer           = answer,
+                chunks           = chunks,
+                response_time_ms = elapsed_ms,
+            )
+
+    # Persist assistant response to history
     st.session_state.messages.append({
         "role": "assistant",
         "content": answer,
