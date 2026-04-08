@@ -33,20 +33,35 @@ TOPICS = [
 
 BOOKS = [
     {
-        "blob_name": "fundamentals_of_data_engineering.pdf.pdf",
+        "blob_name": "fundamentals_of_data_engineering.pdf",
         "title": "Fundamentals of Data Engineering",
-        "url": "https://www.oreilly.com/library/view/fundamentals-of-data/9781098108298/"
+        "url": "https://freecomputerbooks.com/books/Fundamentals-of-Data-Engineering.pdf",
     },
     {
         "blob_name": "The-Data-Engineers-Guide-to-Apache-Spark.pdf",
         "title": "The Data Engineer's Guide to Apache Spark",
-        "url": "https://www.databricks.com/resources/ebook/learning-spark-lightning-fast-data-analytics"
+        "url": "https://github.com/xrenaissance/Functional-Programming_in_Scala_Specialization/blob/master/The-Data-Engineers-Guide-to-Apache-Spark.pdf",
     },
     {
         "blob_name": "Generative-AI-and-LLMs-for-Dummies.pdf",
         "title": "Generative AI and LLMs for Dummies",
-        "url": "https://www.dummies.com/article/technology/information-technology/ai/generative-ai/"
-    }
+        "url": "https://www.snowflake.com/wp-content/uploads/2024/01/Generative-AI-and-LLMs-for-Dummies.pdf",
+    },
+    {
+        "blob_name": "cloud-data-engineering-for-dummies-.pdf",
+        "title": "Cloud Data Engineering for Dummies",
+        "url": "https://www.snowflake.com/wp-content/uploads/2020/12/cloud-data-engineering-for-dummies-.pdf",
+    },
+    {
+        "blob_name": "Cloud-Data-Warehousing-For-Dummies-3rd-Edition.pdf",
+        "title": "Cloud Data Warehousing for Dummies",
+        "url": "https://www.snowflake.com/wp-content/uploads/2023/11/Cloud-Data-Warehousing-For-Dummies-3rd-Edition.pdf",
+    },
+    {
+        "blob_name": "Building-Applications-with-Snowpark-for-Dummies.pdf",
+        "title": "Building Applications with Snowpark for Dummies",
+        "url": "https://www.snowflake.com/wp-content/uploads/2024/01/Building-Applications-with-Snowpark-for-Dummies.pdf",
+    },
 ]
 
 def clean_text(text: str) -> str:
